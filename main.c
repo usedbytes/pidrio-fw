@@ -4,8 +4,8 @@
 #include <util/delay.h>
 #include <avr/interrupt.h>
 
-#define LCD_ADDR 0x74   // Address to match for LCD
-#define NODE_ADDR 0x76  // Address to for LEDs/buttons 
+#define LCD_ADDR  0x3A  // Address to match for LCD
+#define NODE_ADDR 0x3B  // Address to for LEDs/buttons 
 
 // i2c state machines
 #define MODES 4
@@ -26,7 +26,7 @@ void (*state_machines[MODES])(void) = {
         state_machine_btns
 };
 
-volatile struct {
+volatile static struct {
     uint8_t led;
     uint8_t target[4];
     uint8_t current[3];
@@ -34,12 +34,14 @@ volatile struct {
 } state_leds;
 
 #define HOLD_TIME 32 
-volatile struct {
+volatile static struct {
     uint8_t pressed;
     uint8_t held;
     int8_t count[8];
+    uint8_t scroll;
 } state_btns;
-
+#define CW 0x1
+#define CCW 0x2
 
 // RGB LED definitions
 #define RED_OC OCR1BL
@@ -80,7 +82,7 @@ void setup_timer0( void ) {
     BLUE_OC = ~0;
     OCR0B = 0x80; // Square wave on OCR0B for voltage inverter
 
-    TCCR0B |= (4 << CS00); // Clock source = CLK/256
+    TCCR0B |= (3 << CS00); // Prescaler CLK/64
 }
 
 /* timer1 used for red and green LEDs
@@ -95,7 +97,7 @@ void setup_timer1( void ) {
     RED_OC = ~0;
     GREEN_OC = ~0;
 
-    TCCR1B |= (4 << CS10); // Prescaler = CLK/256
+    TCCR1B |= (3 << CS10); // Prescaler CLK/64 
 }
 
 /* timer2 used for input handling 
@@ -114,9 +116,9 @@ void setup_timer2( void ) {
 
 void setup_i2c( void ) {
     
-    // Match 0x74 OR 0x76
-    TWAR = (0x74 << 1);
-    TWAMR = (0x02 << 1);
+    // Match 0x3A OR 0x3B
+    TWAR = (LCD_ADDR << 1);
+    TWAMR = (0x01 << 1);
 
     TWCR = (1 << TWEA) | (1 << TWEN) | (1 << TWIE); 
 }
@@ -129,6 +131,10 @@ void setup_io( void ) {
     // Internal pull-ups. Buttons are active low
     PORTC |= 0xF;
     PORTD |= 0xF;
+
+    // Scroll wheel interrupts
+    EICRA = 0x3;
+    EIMSK = 0x1;
 
     // Pi reset FET
     DDRB |= (1 << PI_RST);
@@ -145,8 +151,9 @@ int main(void) {
     setup_io();
 
     sei();
+    DDRD |= 0x10;
     for (;;) {
-        _delay_ms(1000);
+        PORTD |= 0x10;
 //        PI_PORT ^= (1 << PI_PWR);
     }
 	return 0;
@@ -154,29 +161,44 @@ int main(void) {
 
 // Happens at 32 Hz
 ISR(TIMER2_COMPA_vect) {
-    uint8_t i, snapshot;
+    uint8_t i, snapshot, pressed; 
+    static uint8_t low = 0;
 
     // Button Handling
-    snapshot = ~((PORTD << 4) | (PORTC & 0xF));
-    state_btns.pressed = snapshot;
+    snapshot = (((PIND << 4) | (PINC & 0xF) | 0xC0));
+    pressed = (snapshot & low);
+    low = snapshot = ~snapshot;
     for (i = 0; i < 6; i++, snapshot >>= 1) {
         if (snapshot & 1) {
             state_btns.count[i]++;
+            if (state_btns.count[i] > HOLD_TIME) {
+                state_btns.held |= (1 << i);
+                state_btns.count[i] = -HOLD_TIME;
+            }
+        } else if (state_btns.count[i] < 0) {
+            pressed &= ~(1 << i);
+            state_btns.count[i] = 0;
         } else {
-            state_btns.count[i] = -10;
-        }
-        if (state_btns.count[i] > HOLD_TIME) {
-            state_btns.held |= (1 << i);
-            state_btns.count[i] = -10;
+            state_btns.count[i] = 0;
         }
     }
+    if (state_btns.scroll & CW) {
+        state_btns.count[BTN_DOWN]++;
+        state_btns.count[BTN_DOWN] %= 8;
+    }
+    if (state_btns.scroll & CCW) {
+        state_btns.count[BTN_UP]++;
+        state_btns.count[BTN_UP] %= 8;
+    }
+    state_btns.scroll = 0;
     if (state_btns.count[BTN_UP]) {
-        state_btns.pressed |= (1 << BTN_UP);
+        pressed |= (1 << BTN_UP);
     }
     if (state_btns.count[BTN_DOWN]) {
-        state_btns.pressed |= (1 << BTN_DOWN);
+        pressed |= (1 << BTN_DOWN);
     }
-    
+    state_btns.pressed |= pressed;
+
     // LED Handling
     for (i = 0; i < 3; i++) {
         int16_t distance = state_leds.target[i] - state_leds.current[i];
@@ -189,18 +211,9 @@ ISR(TIMER2_COMPA_vect) {
         } else {
                 state_leds.current[i] = state_leds.target[i];
         }
-        /*
-        if ((distance) && (state_leds.speed % distance)) {
-                state_leds.current[i] = state_leds.target[i] - 
-                                        (state_leds.speed % distance);
-        } else {
-            state_leds.current[i] = state_leds.target[i];
-        }
-        */
-        *(led_ocr[i]) = state_leds.current[i];
+    
+        *(led_ocr[i]) = ~state_leds.current[i];
     }
-
-
     
 }
 
@@ -216,11 +229,28 @@ void state_machine_idle( void ) {
             }
             break;
         case 0xA8: // Read ADDR matched
-            if (TWDR == ((NODE_ADDR + 1) << 1)) {
+            if (TWDR == ((NODE_ADDR << 1) + 1)) {
                 mode = MODE_BTNS;
+                TWDR = state_btns.pressed;
+                if (state_btns.count[BTN_UP] && 
+                        (state_btns.pressed & (1 << BTN_UP))) {
+                    state_btns.count[BTN_UP]--;
+                }
+                if (state_btns.count[BTN_DOWN] && 
+                        (state_btns.pressed & (1 << BTN_DOWN))) {
+                    state_btns.count[BTN_DOWN]--;
+                }
+                state_btns.pressed = 0;
             } else {
                 // NAK?
+                TWDR = 0xFF;
+                TWCR &= ~(1 << TWEA);
             }
+            break;
+        case 0xC0:
+        case 0xC8:
+            TWCR |= 1 << TWEA;
+            break;
     }
 }
 
@@ -243,12 +273,6 @@ void state_machine_leds( void ) {
             state_leds.led %= 4;
             break;
         case 0xA0: // Received STOP
-            // Set up a move
-            //if ( state == MODE_LEDS ) {
-            //    RED_OC = ~led_vals[I_RED];
-            //    GREEN_OC = ~led_vals[I_GREEN];
-            //    BLUE_OC = ~led_vals[I_BLUE];
-            //}
             state_leds.speed = state_leds.target[3];
             state_leds.led = 0;
             mode = MODE_IDLE;
@@ -258,27 +282,12 @@ void state_machine_leds( void ) {
 }
 
 void state_machine_btns( void ) {
-    uint8_t i = 0;
 
     switch (TWSR) {
         case 0xB8:
-            if (i) {
-                TWDR = state_btns.held;
-                state_btns.held = 0;
-                TWCR &= ~(1 << TWEA);
-            } else {
-                TWDR = state_btns.pressed;
-                if (state_btns.count[BTN_UP] && 
-                        (state_btns.pressed & (1 << BTN_UP))) {
-                    state_btns.count[BTN_UP]--;
-                }
-                if (state_btns.count[BTN_DOWN] && 
-                        (state_btns.pressed & (1 << BTN_DOWN))) {
-                    state_btns.count[BTN_DOWN]--;
-                }
-                state_btns.pressed = 0;
-            }
-            i ^= 1;
+            TWDR = state_btns.held;
+            state_btns.held = 0;
+            TWCR &= ~(1 << TWEA);
             break;
         case 0xC0:
         case 0xC8:
@@ -294,3 +303,29 @@ ISR(TWI_vect) {
     TWCR |= (1 << TWINT); 
 }
 
+/*
+ * Scroll Wheel Handling
+ * INT0 (PD2) __|```|___|```|___|```|_
+ * INT1 (PD3) ____|```|___|```|___|```|_
+ *            Clockwise Rotation ------>
+ */
+ISR(INT0_vect) {
+    EIMSK = 0;
+    uint8_t pins = PIND;
+    if (EICRA & 0x1) { // Rising
+        if (pins & 0x8) {
+            state_btns.scroll |= CCW;
+        } else {
+            state_btns.scroll |= CW;
+        }
+        EICRA = 0x2;
+    } else {
+        if (pins & 0x8) {
+            state_btns.scroll |= CW;
+        } else {
+            state_btns.scroll |= CCW;
+        }
+        EICRA = 0x3;
+    }
+    EIMSK = 0x1;
+}
