@@ -7,6 +7,11 @@
 #define LCD_ADDR  0x3A  // Address to match for LCD
 #define NODE_ADDR 0x3B  // Address to for LEDs/buttons 
 
+#define STATE_BOOTING   0
+#define STATE_ON        1
+#define STATE_OFF       2
+volatile uint8_t state = STATE_BOOTING;
+
 // i2c state machines
 #define MODES 4
 #define MODE_IDLE 0
@@ -67,8 +72,15 @@ volatile uint8_t * led_ocr[3] = {&RED_OC, &GREEN_OC, &BLUE_OC};
 #define BTN_DOWN    7
 
 // Other IO
+// Set PB0 high to RESET
 #define PI_PORT PORTB
 #define PI_RST  0
+
+// PD4 pulled high by Pi when on. Must NOT be set high (Pi not 5 V tolerant)
+#define STATUS_PORT PORTD
+// PI_STATUS on PCINT20
+#define PI_STATUS 4
+#define PWR_LED 7
 
 /* timer0 used for blue LEDs and voltage inverter (VLCD)
  */
@@ -140,6 +152,54 @@ void setup_io( void ) {
     DDRB |= (1 << PI_RST);
     PORTB &= ~(1 << PI_RST);
 
+    // Status detect and power LED
+    DDRD |= (1 << PWR_LED);
+    DDRD &= ~(1 << PI_STATUS);
+    STATUS_PORT |= (1 << PWR_LED);
+
+    // Pi status interrupt
+    PCICR |= (1 << PCIE2); 
+    PCMSK2 |= (1 << PCINT20);
+
+}
+
+void reset_pi( void ) {
+    PI_PORT |= (1 << PI_RST);
+    _delay_ms(10);
+    PI_PORT &= ~(1 << PI_RST);
+}
+
+
+void boot_lighting( void ) {
+    static uint8_t phase = 0;
+    const uint8_t light_cycle[6][3] = {
+        {0xFF, 0x00, 0x00},
+        {0xFF, 0xFF, 0x00},
+        {0x00, 0xFF, 0x00},
+        {0x00, 0xFF, 0xFF},
+        {0x00, 0x00, 0xFF},
+        {0xFF, 0x00, 0xFF}
+    };
+
+    if ((state_leds.current[I_RED]   == light_cycle[phase][I_RED])   &&
+        (state_leds.current[I_GREEN] == light_cycle[phase][I_GREEN]) &&
+        (state_leds.current[I_BLUE]  == light_cycle[phase][I_BLUE])) {
+        phase++;
+        phase %= 6;
+        state_leds.target[I_RED]     = light_cycle[phase][I_RED];
+        state_leds.target[I_GREEN]   = light_cycle[phase][I_GREEN];
+        state_leds.target[I_BLUE]    = light_cycle[phase][I_BLUE];
+        state_leds.speed = 8;
+    } else if ( (state_leds.current[I_RED]   == 0) &&
+                (state_leds.current[I_GREEN] == 0) &&
+                (state_leds.current[I_BLUE]  == 0)) {
+        phase = 0;
+        state_leds.target[I_RED]     = light_cycle[phase][I_RED];
+        state_leds.target[I_GREEN]   = light_cycle[phase][I_GREEN];
+        state_leds.target[I_BLUE]    = light_cycle[phase][I_BLUE];
+        state_leds.speed = 8;
+    }
+
 }
 
 int main(void) {
@@ -151,10 +211,23 @@ int main(void) {
     setup_io();
 
     sei();
-    DDRD |= 0x10;
     for (;;) {
-        PORTD |= 0x10;
-//        PI_PORT ^= (1 << PI_PWR);
+          if (state == STATE_OFF) {
+              if (state_btns.held & (1 << BTN_PWR)) {
+                  reset_pi();
+                  state = STATE_BOOTING;
+                  STATUS_PORT |= (1 << PWR_LED);
+                  state_btns.pressed = 0;
+                  state_btns.held = 0;
+              } else if ((state_leds.current[I_RED] == 0) &&
+                  (state_leds.current[I_GREEN] == 0) &&
+                  (state_leds.current[I_BLUE] == 0)) {
+                  STATUS_PORT &= ~(1 << PWR_LED);
+              }
+          } else if (state == STATE_BOOTING) {
+              boot_lighting();
+          }
+
     }
 	return 0;
 }
@@ -173,12 +246,13 @@ ISR(TIMER2_COMPA_vect) {
             state_btns.count[i]++;
             if (state_btns.count[i] > HOLD_TIME) {
                 state_btns.held |= (1 << i);
-                state_btns.count[i] = -HOLD_TIME;
+                state_btns.count[i] = HOLD_TIME;
             }
-        } else if (state_btns.count[i] < 0) {
-            pressed &= ~(1 << i);
-            state_btns.count[i] = 0;
         } else {
+            if (state_btns.held & (1 << i)) {
+                pressed &= ~(1 << i);
+                state_btns.held &= ~(1 << i);
+            }
             state_btns.count[i] = 0;
         }
     }
@@ -218,6 +292,7 @@ ISR(TIMER2_COMPA_vect) {
 }
 
 void state_machine_idle( void ) {
+
 
     switch (TWSR) {
         case 0x60: // Write ADDR matched
@@ -286,13 +361,15 @@ void state_machine_btns( void ) {
     switch (TWSR) {
         case 0xB8:
             TWDR = state_btns.held;
-            state_btns.held = 0;
-            TWCR &= ~(1 << TWEA);
+            //TWDR = 0x24;
+            //state_btns.held = 0;
+            //state_leds.target[3] = 3;
+            //TWCR &= ~(1 << TWEA);
             break;
         case 0xC0:
         case 0xC8:
             mode = MODE_IDLE;
-            TWCR |= 1 << TWEA;
+            TWCR |= (1 << TWEA);
             break;
     }
 }
@@ -329,3 +406,24 @@ ISR(INT0_vect) {
     }
     EIMSK = 0x1;
 }
+
+/*
+ * PCINT20 (PD7)
+ */
+
+ISR(PCINT2_vect) {
+    uint8_t pi_status = PIND & (1 << PI_STATUS);
+    
+    if (!pi_status) {
+        // Pi just went off
+        state = STATE_OFF;
+        state_leds.target[I_RED] = 0;
+        state_leds.target[I_GREEN] = 0;
+        state_leds.target[I_BLUE] = 0;
+        state_leds.speed = 2;
+    } else if (pi_status) {
+        state = STATE_ON;
+        STATUS_PORT |= (1 << PWR_LED);
+    }
+}
+
