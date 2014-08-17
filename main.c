@@ -27,9 +27,10 @@
 #define LCD_ADDR  0x3A  // Address to match for LCD
 #define NODE_ADDR 0x3B  // Address to for LEDs/buttons 
 
-#define STATE_BOOTING   0
-#define STATE_ON        1
-#define STATE_OFF       2
+#define STATE_BOOTING       0
+#define STATE_ON            1
+#define STATE_OFF           2
+#define STATE_POWERING_OFF  3
 volatile uint8_t state = STATE_BOOTING;
 
 // i2c state machines
@@ -308,6 +309,20 @@ ISR(TIMER2_COMPA_vect) {
     
         *(led_ocr[i]) = ~state_leds.current[i];
     }
+    /*
+    if (!memcmp(state_leds.current, state_leds.target, 3)) {
+        if (state == STATE_POWERING_OFF) {
+            state_btns.pressed = 0;
+            state_btns.held = 0;
+            state = STATE_OFF;
+        }
+    }
+    */
+    uint8_t pi_status = PIND & (1 << PI_STATUS);
+    if (pi_status) {
+        state = STATE_ON;
+        STATUS_PORT |= (1 << PWR_LED);
+    }
     
 }
 
@@ -441,6 +456,11 @@ ISR(PCINT2_vect) {
         state_leds.target[I_GREEN] = 0;
         state_leds.target[I_BLUE] = 0;
         state_leds.speed = 2;
+        // Prevent immediate reboot
+        state_btns.pressed = 0;
+        state_btns.held = 0;
+        state_btns.count[0] = 0;
+
     } else if (pi_status) {
         state = STATE_ON;
         STATUS_PORT |= (1 << PWR_LED);
